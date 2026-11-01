@@ -7,7 +7,9 @@ use std::{
 use oxc_language_server::run_server;
 use tower_lsp_server::gen_lsp_types::Uri;
 
-use crate::core::{ExternalServices, JsConfigLoaderCb, Language};
+use crate::core::Language;
+#[cfg(feature = "napi")]
+use crate::core::{ExternalServices, JsConfigLoaderCb};
 
 mod options;
 mod server_formatter;
@@ -31,7 +33,10 @@ pub fn create_fake_file_path(language: Language, root: &Path, uri: &Uri) -> Path
 }
 
 /// Run the language server
-pub async fn run_lsp(js_config_loader: JsConfigLoaderCb, external_services: ExternalServices) {
+pub async fn run_lsp(
+    #[cfg(feature = "napi")] js_config_loader: JsConfigLoaderCb,
+    #[cfg(feature = "napi")] external_services: ExternalServices,
+) {
     let version = {
         let mut version = env!("CARGO_PKG_VERSION").to_string();
         if let Some(vp_version) = oxc_config::vp_version() {
@@ -40,12 +45,16 @@ pub async fn run_lsp(js_config_loader: JsConfigLoaderCb, external_services: Exte
         version
     };
 
+    #[cfg(feature = "napi")]
+    let builder =
+        server_formatter::ServerFormatterBuilder::new(js_config_loader, external_services);
+    #[cfg(not(feature = "napi"))]
+    let builder = server_formatter::ServerFormatterBuilder::default();
+
     run_server(
         "oxfmt".to_string(),
         version,
-        oxc_language_server::WorkerManager::new_dynamic(Arc::new(
-            server_formatter::ServerFormatterBuilder::new(js_config_loader, external_services),
-        )),
+        oxc_language_server::WorkerManager::new_dynamic(Arc::new(builder)),
     )
     .await;
 }

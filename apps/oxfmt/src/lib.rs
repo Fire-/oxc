@@ -6,7 +6,6 @@ mod core;
 mod prettier_compat;
 
 pub use core::oxfmtrc;
-#[cfg(feature = "napi")]
 pub mod lsp;
 #[cfg(feature = "napi")]
 mod main_napi;

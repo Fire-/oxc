@@ -104,7 +104,6 @@ impl Language {
 
     /// Resolve an LSP `languageId`: VS Code's ids, which match the embedded names except for the React ones.
     /// `angular` is not a VS Code id, accepted for editors naming Angular templates so (#20242).
-    #[cfg(feature = "napi")]
     pub fn from_lsp_id(id: &str) -> Option<Self> {
         match id {
             "javascriptreact" => Some(Self::Jsx),
@@ -115,7 +114,6 @@ impl Language {
 
     /// LSP only: the extension of the fake path for an in-memory document,
     /// so that config scopes, `ignorePatterns` and `overrides` see it as a file of this language.
-    #[cfg(feature = "napi")]
     pub fn to_lsp_extension(self) -> &'static str {
         match self {
             Self::Javascript => "js",

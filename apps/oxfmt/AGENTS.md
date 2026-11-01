@@ -12,7 +12,8 @@ The `oxfmt` implemented under this directory serves several purposes.
   - Entry point: `src-js/cli.ts` which uses `run_cli()` from `src/main_napi.rs`
   - Build with `pnpm build`
 - Pure Rust CLI
-  - Limited feature set, CLI usage only, no LSP, no Stdin support
+  - Limited feature set, CLI usage and LSP (`--lsp`), no Stdin support
+  - LSP disables formatting for a workspace whose root config is JS/TS, since only the Node.js build can load it
   - Formats only languages which we rewrite formatter in Rust
   - Entry point: `main()` in `src/main.rs`
   - Build with `cargo build --no-default-features`

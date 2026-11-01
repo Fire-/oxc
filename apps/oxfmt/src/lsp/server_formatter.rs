@@ -8,7 +8,7 @@ use ignore::gitignore::Gitignore;
 use tower_lsp_server::gen_lsp_types::{
     DocumentFormattingProvider, MessageType, Pattern, Range, ServerCapabilities, TextEdit, Uri,
 };
-use tracing::{debug, error, warn};
+use tracing::{debug, warn};
 
 use oxc_language_server::{
     Capabilities, ClientMessage, LanguageId, TextDocument, Tool, ToolBuildResult, ToolBuilder,
@@ -16,26 +16,40 @@ use oxc_language_server::{
     utils::normalize_user_config_path_to_watch_pattern,
 };
 
+#[cfg(not(feature = "napi"))]
+use oxc_config::is_js_config_path;
+
 use crate::core::{
-    ConfigScopes, ExternalServices, FormatResult, JsConfigLoaderCb, Language, ResolveOutcome,
-    SourceFormatter, build_global_ignore_matchers, config_discovery, is_ignored,
-    resolve_ignore_paths, utils,
+    ConfigScopes, FormatResult, Language, ResolveOutcome, SourceFormatter,
+    build_global_ignore_matchers, config_discovery, is_ignored, resolve_ignore_paths, utils,
 };
+#[cfg(feature = "napi")]
+use crate::core::{ExternalServices, JsConfigLoaderCb};
 use crate::lsp::create_fake_file_path;
 use crate::lsp::options::FormatOptions as LSPFormatOptions;
 
+#[cfg_attr(not(feature = "napi"), derive(Default))]
 pub struct ServerFormatterBuilder {
+    #[cfg(feature = "napi")]
     js_config_loader: JsConfigLoaderCb,
+    #[cfg(feature = "napi")]
     external_services: ExternalServices,
 }
 
 impl ServerFormatterBuilder {
+    #[cfg(feature = "napi")]
     pub fn new(js_config_loader: JsConfigLoaderCb, external_services: ExternalServices) -> Self {
         Self { js_config_loader, external_services }
     }
 
     /// Create a dummy `ServerFormatterBuilder` for testing.
-    #[cfg(test)]
+    #[cfg(all(test, not(feature = "napi")))]
+    pub fn dummy() -> Self {
+        Self::default()
+    }
+
+    /// Create a dummy `ServerFormatterBuilder` for testing.
+    #[cfg(all(test, feature = "napi"))]
     pub fn dummy() -> Self {
         Self {
             js_config_loader: std::sync::Arc::new(|_| {
@@ -51,6 +65,7 @@ impl ServerFormatterBuilder {
     ///
     /// # Panics
     /// Panics if the root URI cannot be converted to a file path.
+    #[cfg_attr(not(feature = "napi"), expect(clippy::unused_self))]
     pub fn build(
         &self,
         root_uri: &Uri,
@@ -70,17 +85,21 @@ impl ServerFormatterBuilder {
 
         let num_of_threads = 1; // Single threaded for LSP
         // Use `block_in_place()` to avoid nested async runtime access
+        #[cfg(feature = "napi")]
         if let Err(err) =
             tokio::task::block_in_place(|| self.external_services.init(num_of_threads))
         {
-            error!("Failed to setup external services.\n{err}\n");
+            tracing::error!("Failed to setup external services.\n{err}\n");
         }
-        let source_formatter = SourceFormatter::new(num_of_threads)
-            .with_external_services(Some(self.external_services.clone()));
+        let source_formatter = SourceFormatter::new(num_of_threads);
+        #[cfg(feature = "napi")]
+        let source_formatter =
+            source_formatter.with_external_services(Some(self.external_services.clone()));
 
         let (formatter, client_message) = ServerFormatter::new(
             root_path.to_path_buf(),
             source_formatter,
+            #[cfg(feature = "napi")]
             JsConfigLoaderCb::clone(&self.js_config_loader),
             explicit_config_path,
             use_nested_config,
@@ -110,6 +129,7 @@ impl ToolBuilder for ServerFormatterBuilder {
 pub struct ServerFormatter {
     root_path: PathBuf,
     source_formatter: SourceFormatter,
+    #[cfg(feature = "napi")]
     js_config_loader: JsConfigLoaderCb,
     /// Explicit `fmt.configPath` from LSP settings.
     /// When set, all files use this single config.
@@ -131,6 +151,10 @@ struct FormatterState {
     scopes: ConfigScopes,
     /// `.prettierignore` matchers (workspace-level, shared across all scopes).
     ignore_matchers: Vec<Gitignore>,
+    /// The root config is a JS/TS config, which only the Node.js build can load.
+    /// Formatting with the default options instead would rewrite files in the wrong style.
+    #[cfg(not(feature = "napi"))]
+    formatting_disabled: bool,
 }
 
 impl Tool for ServerFormatter {
@@ -204,6 +228,7 @@ impl Tool for ServerFormatter {
             &self.root_path,
             self.explicit_config_path.as_deref(),
             self.use_nested_config,
+            #[cfg(feature = "napi")]
             &self.js_config_loader,
         );
         *self.state.write().expect("state rwlock poisoned") = Arc::new(new_state);
@@ -216,6 +241,12 @@ impl Tool for ServerFormatter {
     }
 
     fn run_format(&self, document: TextDocument) -> Result<Vec<TextEdit>, String> {
+        #[cfg(not(feature = "napi"))]
+        if self.snapshot().formatting_disabled {
+            debug!("Formatting is disabled by a JS/TS root config");
+            return Ok(vec![]);
+        }
+
         let file_content;
         let (result, source_text) = if document.uri.scheme().as_str() == "file" {
             let Some(path) = uri_to_file_path(document.uri) else {
@@ -278,7 +309,7 @@ impl ServerFormatter {
     pub fn new(
         root_path: PathBuf,
         source_formatter: SourceFormatter,
-        js_config_loader: JsConfigLoaderCb,
+        #[cfg(feature = "napi")] js_config_loader: JsConfigLoaderCb,
         explicit_config_path: Option<PathBuf>,
         use_nested_config: bool,
     ) -> (Self, Vec<ClientMessage>) {
@@ -286,12 +317,14 @@ impl ServerFormatter {
             &root_path,
             explicit_config_path.as_deref(),
             use_nested_config,
+            #[cfg(feature = "napi")]
             &js_config_loader,
         );
         (
             Self {
                 root_path,
                 source_formatter,
+                #[cfg(feature = "napi")]
                 js_config_loader,
                 explicit_config_path,
                 use_nested_config,
@@ -310,21 +343,32 @@ impl ServerFormatter {
     /// LSP must keep editing usable even when the user's config is broken,
     /// so the root falls back to the default empty config with a warning instead of bubbling the error up.
     /// Likewise, a broken `.prettierignore` is skipped with a warning.
+    /// Without `napi`, a JS/TS root config disables formatting instead (see [`FormatterState`]).
     fn build_state(
         root_path: &Path,
         explicit_config_path: Option<&Path>,
         use_nested_config: bool,
-        js_config_loader: &JsConfigLoaderCb,
+        #[cfg(feature = "napi")] js_config_loader: &JsConfigLoaderCb,
     ) -> (FormatterState, Vec<ClientMessage>) {
         let mut client_message = vec![];
+        #[cfg(not(feature = "napi"))]
+        let mut formatting_disabled = false;
         let scopes = match ConfigScopes::load(
             root_path,
             explicit_config_path,
             use_nested_config,
+            #[cfg(feature = "napi")]
             Some(js_config_loader),
         ) {
             Ok(scopes) => scopes,
             Err(err) => {
+                #[cfg(not(feature = "napi"))]
+                let err = if root_config_is_js(root_path, explicit_config_path) {
+                    formatting_disabled = true;
+                    format!("{err}\nFormatting is disabled for this workspace.")
+                } else {
+                    err
+                };
                 client_message.push(ClientMessage {
                     message: format!(
                         "{}: {err}",
@@ -335,6 +379,7 @@ impl ServerFormatter {
                 ConfigScopes::with_default_root(
                     root_path,
                     use_nested_config,
+                    #[cfg(feature = "napi")]
                     Some(js_config_loader),
                 )
             }
@@ -356,7 +401,13 @@ impl ServerFormatter {
             }
         };
 
-        (FormatterState { scopes, ignore_matchers }, client_message)
+        let state = FormatterState {
+            scopes,
+            ignore_matchers,
+            #[cfg(not(feature = "napi"))]
+            formatting_disabled,
+        };
+        (state, client_message)
     }
 
     /// Snapshot the current state.
@@ -379,6 +430,9 @@ impl ServerFormatter {
     ) -> Result<Option<FormatResult>, String> {
         let resolver = match scopes.resolve(path) {
             Ok(r) => r,
+            // The root config's style would be wrong for this scope
+            #[cfg(not(feature = "napi"))]
+            Err(err) if nearest_config_is_js(path) => return Err(err),
             Err(err) => {
                 warn!(
                     "Failed to resolve nested config for {}: {err}, falling back to root",
@@ -439,6 +493,24 @@ impl ServerFormatter {
 }
 
 // ---
+
+/// Whether the workspace root config is a JS/TS config, given or discovered like [`ConfigScopes::load`].
+#[cfg(not(feature = "napi"))]
+fn root_config_is_js(root_path: &Path, explicit_config_path: Option<&Path>) -> bool {
+    match explicit_config_path {
+        Some(path) => is_js_config_path(path),
+        None => nearest_config_is_js(root_path),
+    }
+}
+
+/// Whether the nearest config file upwards from `path` is a JS/TS config.
+#[cfg(not(feature = "napi"))]
+fn nearest_config_is_js(path: &Path) -> bool {
+    let discovery = config_discovery();
+    let nearest =
+        path.ancestors().find_map(|dir| discovery.find_unique_config_by_readdir(dir).transpose());
+    matches!(nearest, Some(Ok(config)) if is_js_config_path(config.path()))
+}
 
 /// Deserialize `LSPFormatOptions` from JSON, falling back to defaults on failure.
 fn deserialize_lsp_options(value: serde_json::Value) -> LSPFormatOptions {
@@ -657,5 +729,165 @@ mod tests {
             let (start, end, replacement) = compute_minimal_text_edit(src_crlf, src_lf);
             assert_eq!((start, end, replacement), (5, src_crlf.len() as u32 - 5, "\nline2\n"));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests_format {
+    use std::{fs, path::Path, sync::Arc};
+
+    use oxc_language_server::{
+        ClientMessage, LanguageId, TextDocument, Tool, uri_utils::file_path_to_uri,
+    };
+    use serde_json::Value;
+    use tower_lsp_server::gen_lsp_types::{TextEdit, Uri};
+    #[cfg(not(feature = "napi"))]
+    use {serde_json::json, std::str::FromStr, tower_lsp_server::gen_lsp_types::MessageType};
+
+    use super::{ServerFormatter, ServerFormatterBuilder};
+
+    fn build(root: &Path, options: Value) -> (ServerFormatter, Vec<ClientMessage>) {
+        let root_uri = file_path_to_uri(root).unwrap();
+        ServerFormatterBuilder::dummy().build(&root_uri, options)
+    }
+
+    fn format_uri(
+        formatter: &ServerFormatter,
+        uri: &Uri,
+        language_id: &str,
+        text: &str,
+    ) -> Result<Vec<TextEdit>, String> {
+        formatter.run_format(TextDocument::new(
+            uri,
+            LanguageId::new(language_id.to_string()),
+            Some(Arc::from(text)),
+        ))
+    }
+
+    fn format(
+        formatter: &ServerFormatter,
+        path: &Path,
+        language_id: &str,
+        text: &str,
+    ) -> Result<Vec<TextEdit>, String> {
+        format_uri(formatter, &file_path_to_uri(path).unwrap(), language_id, text)
+    }
+
+    fn messages(messages: &[ClientMessage]) -> Vec<&str> {
+        messages.iter().map(|m| m.message.as_str()).collect()
+    }
+
+    #[test]
+    fn formats_native_languages_with_json_config() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(".oxfmtrc.json"), r#"{ "semi": false }"#).unwrap();
+        let (formatter, client_messages) = build(dir.path(), Value::Null);
+        assert!(client_messages.is_empty(), "{:?}", messages(&client_messages));
+
+        // `semi: false` from `.oxfmtrc.json` removes only the `;`
+        let edits =
+            format(&formatter, &dir.path().join("a.ts"), "typescript", "const a = 1;\n").unwrap();
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].new_text, "");
+        assert_eq!((edits[0].range.start.line, edits[0].range.start.character), (0, 11));
+        assert_eq!((edits[0].range.end.line, edits[0].range.end.character), (0, 12));
+
+        for (file, language_id, text) in [
+            ("a.json", "json", r#"{"a":1}"#),
+            ("a.css", "css", "a{color:red}"),
+            ("a.scss", "scss", "a{b{color:red}}"),
+            ("a.graphql", "graphql", "query{a}"),
+            ("a.yaml", "yaml", "a:   1"),
+            ("a.md", "markdown", "* item"),
+            ("a.toml", "toml", "a=1"),
+        ] {
+            let edits = format(&formatter, &dir.path().join(file), language_id, text).unwrap();
+            assert!(!edits.is_empty(), "`{file}` should be formatted natively");
+        }
+    }
+
+    #[test]
+    #[cfg(not(feature = "napi"))]
+    fn prettier_languages_are_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (formatter, _) = build(dir.path(), Value::Null);
+
+        for (file, language_id) in [("a.vue", "vue"), ("a.html", "html"), ("a.mdx", "mdx")] {
+            let result = format(&formatter, &dir.path().join(file), language_id, "<div   ></div>");
+            assert_eq!(result, Ok(vec![]), "`{file}`");
+        }
+
+        let untitled = Uri::from_str("untitled:Untitled-1").unwrap();
+        assert_eq!(format_uri(&formatter, &untitled, "vue", "<div   ></div>"), Ok(vec![]));
+    }
+
+    /// A JS/TS config needs the Node.js build.
+    /// Formatting with the default options instead would rewrite files in the wrong style.
+    #[test]
+    #[cfg(not(feature = "napi"))]
+    fn js_config_disables_formatting() {
+        for (config_file, options) in [
+            ("oxfmt.config.ts", Value::Null),
+            ("fmt.config.ts", json!({ "fmt.configPath": "./fmt.config.ts" })),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            fs::write(dir.path().join(config_file), "export default { semi: false };\n").unwrap();
+            let (formatter, client_messages) = build(dir.path(), options);
+
+            assert_eq!(client_messages.len(), 1, "{:?}", messages(&client_messages));
+            let message = &client_messages[0];
+            assert_eq!(message.r#type, MessageType::Error);
+            assert!(message.message.contains(config_file), "{}", message.message);
+            assert!(message.message.contains("Formatting is disabled"), "{}", message.message);
+
+            // The default options would change both
+            let file = dir.path().join("a.ts");
+            assert_eq!(format(&formatter, &file, "typescript", "const a=1"), Ok(vec![]));
+            let untitled = Uri::from_str("untitled:Untitled-1").unwrap();
+            assert_eq!(format_uri(&formatter, &untitled, "typescript", "const a=1"), Ok(vec![]));
+        }
+    }
+
+    #[test]
+    #[cfg(not(feature = "napi"))]
+    fn json_config_reenables_formatting_after_js_config_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let js_config = dir.path().join("oxfmt.config.ts");
+        fs::write(&js_config, "export default {};\n").unwrap();
+        let (formatter, _) = build(dir.path(), Value::Null);
+        let file = dir.path().join("a.ts");
+        assert_eq!(format(&formatter, &file, "typescript", "const a=1"), Ok(vec![]));
+
+        fs::remove_file(&js_config).unwrap();
+        let json_config = dir.path().join(".oxfmtrc.json");
+        fs::write(&json_config, "{}").unwrap();
+        let changes = formatter.handle_watched_file_change(
+            &ServerFormatterBuilder::dummy(),
+            &file_path_to_uri(&json_config).unwrap(),
+            &file_path_to_uri(dir.path()).unwrap(),
+            Value::Null,
+        );
+        assert!(changes.client_messages.is_empty(), "{:?}", messages(&changes.client_messages));
+        assert_eq!(format(&formatter, &file, "typescript", "const a=1").unwrap().len(), 1);
+    }
+
+    #[test]
+    #[cfg(not(feature = "napi"))]
+    fn nested_js_config_is_an_error_for_its_scope_only() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(".oxfmtrc.json"), "{}").unwrap();
+        let sub = dir.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("oxfmt.config.ts"), "export default { semi: false };\n").unwrap();
+        let (formatter, client_messages) = build(dir.path(), Value::Null);
+        assert!(client_messages.is_empty(), "{:?}", messages(&client_messages));
+
+        // No fallback to the root config, which would format in the wrong style
+        let err = format(&formatter, &sub.join("a.ts"), "typescript", "const a=1").unwrap_err();
+        assert!(err.contains("oxfmt.config.ts"), "{err}");
+
+        let edits =
+            format(&formatter, &dir.path().join("b.ts"), "typescript", "const a=1").unwrap();
+        assert_eq!(edits.len(), 1);
     }
 }

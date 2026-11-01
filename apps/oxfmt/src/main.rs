@@ -1,7 +1,7 @@
 use oxfmt::cli::{CliRunResult, WalkRunner, format_command, init_rayon, init_tracing};
 
 // Pure Rust CLI entry point.
-// This CLI only supports the basic `Cli` mode.
+// This CLI only supports the basic `Cli` mode and `--lsp`.
 // For full featured JS CLI entry point, see `run_cli()` exported by `main_napi.rs`.
 
 #[tokio::main]
@@ -9,6 +9,11 @@ async fn main() -> CliRunResult {
     let command = format_command().run();
 
     init_tracing();
+    #[cfg(not(feature = "napi"))]
+    if matches!(command.mode, oxfmt::cli::Mode::Lsp) {
+        oxfmt::lsp::run_lsp().await;
+        return CliRunResult::None;
+    }
     init_rayon(command.runtime_options.threads);
     WalkRunner::new(command).run()
 }

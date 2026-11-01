@@ -52,7 +52,6 @@ pub enum Mode {
     #[cfg(feature = "napi")]
     Stdin(PathBuf),
     /// Start language server protocol (LSP) server
-    #[cfg(feature = "napi")]
     Lsp,
     /// Initialize `.oxfmtrc.json` with default values
     // NOTE: Actual logic is handled by JS side.
@@ -98,7 +97,13 @@ fn mode() -> impl bpaf::Parser<Mode> {
     }
     #[cfg(not(feature = "napi"))]
     {
-        output_mode_options.fallback(Mode::Cli(OutputMode::Write))
+        let lsp = bpaf::long("lsp")
+            .help("Start language server protocol (LSP) server")
+            .req_flag(Mode::Lsp)
+            .hide_usage();
+        let mode_options = lsp.group_help("Mode Options:");
+
+        bpaf::construct!([mode_options, output_mode_options]).fallback(Mode::Cli(OutputMode::Write))
     }
 }
 
@@ -181,4 +186,15 @@ pub struct RuntimeOptions {
     /// Number of threads to use. Set to 1 for using only 1 CPU core.
     #[bpaf(argument("INT"), hide_usage)]
     pub threads: Option<usize>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Mode, format_command};
+
+    #[test]
+    fn lsp_flag_selects_lsp_mode() {
+        let command = format_command().run_inner(&["--lsp"]).unwrap();
+        assert!(matches!(command.mode, Mode::Lsp));
+    }
 }

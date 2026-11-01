@@ -56,11 +56,10 @@ impl ConfigScopes {
     /// For LSP, which keeps formatting with defaults when the root config is broken,
     /// while nested configs are still detected.
     /// CLI (Walk / Stdin) does not use this and exits with an error instead.
-    #[cfg(feature = "napi")]
     pub fn with_default_root(
         cwd: &Path,
         use_nested: bool,
-        js_config_loader: Option<&JsConfigLoaderCb>,
+        #[cfg(feature = "napi")] js_config_loader: Option<&JsConfigLoaderCb>,
     ) -> Self {
         let mut root = ConfigResolver::from_json_config(None, None)
             .expect("Default ConfigResolver should never fail");
@@ -69,7 +68,12 @@ impl ConfigScopes {
         // Best effort: an unreadable `.editorconfig` is skipped instead of failing again
         let editorconfig =
             load_editorconfig(resolve_editorconfig_path(cwd).as_deref()).ok().flatten();
-        Self::new(root, ConfigLoader::new(editorconfig, js_config_loader.cloned()), use_nested)
+        let loader = ConfigLoader::new(
+            editorconfig,
+            #[cfg(feature = "napi")]
+            js_config_loader.cloned(),
+        );
+        Self::new(root, loader, use_nested)
     }
 
     fn new(root: ConfigResolver, loader: ConfigLoader, use_nested: bool) -> Self {
