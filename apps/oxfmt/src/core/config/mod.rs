@@ -3,6 +3,8 @@ mod editorconfig;
 #[cfg(feature = "napi")]
 mod js_config;
 mod nested;
+#[cfg(not(feature = "napi"))]
+mod node_config;
 mod overrides;
 mod scopes;
 
@@ -46,12 +48,42 @@ fn relative_path<'a>(base_dir: Option<&Path>, path: &'a Path) -> Cow<'a, str> {
     base_dir.and_then(|dir| path.strip_prefix(dir).ok()).unwrap_or(path).to_string_lossy()
 }
 
-pub fn config_discovery() -> ConfigDiscovery {
-    if cfg!(feature = "napi") && vp_version().is_some() {
-        ConfigDiscovery::vite_plus()
-    } else {
-        ConfigDiscovery::oxfmt()
+/// Config discovery for a project rooted at `root`, see [`is_vite_plus_mode`].
+pub fn config_discovery(root: &Path) -> ConfigDiscovery {
+    discovery_for(is_vite_plus_mode(root))
+}
+
+fn discovery_for(vite_plus: bool) -> ConfigDiscovery {
+    if vite_plus { ConfigDiscovery::vite_plus() } else { ConfigDiscovery::oxfmt() }
+}
+
+/// Vite+ mode reads only the `fmt` field of `vite.config.*`, as `vp fmt` does.
+///
+/// On when Vite+ launched oxfmt (`VP_VERSION`).
+/// The pure Rust build also turns it on for a Vite+ project, see [`is_vite_plus_project`],
+/// since an editor launches it directly, without `vp`.
+fn is_vite_plus_mode(root: &Path) -> bool {
+    vp_version().is_some() || (cfg!(not(feature = "napi")) && is_vite_plus_project(root))
+}
+
+/// Whether `root` is in a Vite+ project: going up from `root`,
+/// a `vite.config.*` comes no later than the first `node_modules` with `vite-plus` installed.
+fn is_vite_plus_project(root: &Path) -> bool {
+    #[cfg(not(feature = "napi"))]
+    if node_config::is_disabled() {
+        return false;
     }
+    let vite_plus = ConfigDiscovery::vite_plus();
+    let mut has_vite_config = false;
+    for dir in root.ancestors() {
+        has_vite_config =
+            has_vite_config || matches!(vite_plus.find_unique_config_by_readdir(dir), Ok(Some(_)));
+        // `is_file()` follows symlinks, pnpm links packages into `node_modules/.pnpm`
+        if dir.join("node_modules").join("vite-plus").join("package.json").is_file() {
+            return has_vite_config;
+        }
+    }
+    false
 }
 
 /// Everything a config file load needs besides the file itself,
@@ -61,6 +93,9 @@ pub fn config_discovery() -> ConfigDiscovery {
 #[derive(Clone)]
 struct ConfigLoader {
     discovery: ConfigDiscovery,
+    /// Vite+ mode, where JS/TS configs are loaded through `vite-plus`.
+    #[cfg(not(feature = "napi"))]
+    vite_plus: bool,
     /// Parsed `.editorconfig`, shared by every resolver this loads,
     /// instead of re-reading and re-parsing the same file.
     editorconfig: Option<Arc<EditorConfig>>,
@@ -70,11 +105,15 @@ struct ConfigLoader {
 
 impl ConfigLoader {
     fn new(
+        cwd: &Path,
         editorconfig: Option<EditorConfig>,
         #[cfg(feature = "napi")] js_loader: Option<JsConfigLoaderCb>,
     ) -> Self {
+        let vite_plus = is_vite_plus_mode(cwd);
         Self {
-            discovery: config_discovery(),
+            discovery: discovery_for(vite_plus),
+            #[cfg(not(feature = "napi"))]
+            vite_plus,
             editorconfig: editorconfig.map(Arc::new),
             #[cfg(feature = "napi")]
             js_loader,
@@ -190,13 +229,22 @@ impl ConfigLoader {
 
 #[cfg(not(feature = "napi"))]
 impl ConfigLoader {
-    /// JS/TS config files need the Node.js CLI.
-    #[expect(clippy::unused_self)]
+    /// Load a JS/TS config file in a `node` child process and return the raw JSON value.
+    ///
+    /// Returns `Ok(None)` for a Vite+ config without a `fmt` field.
     fn load_js_config(&self, path: &Path) -> Result<Option<Value>, String> {
-        Err(format!(
-            "JS/TS config file ({}) is not supported in pure Rust CLI.\nUse JSON/JSONC instead.",
-            path.display()
-        ))
+        let kind = if self.vite_plus {
+            node_config::ConfigKind::VitePlus
+        } else {
+            node_config::ConfigKind::Oxfmt
+        };
+        node_config::load(path, kind).map_err(|err| match err {
+            node_config::LoadError::Config(err) => format!(
+                "{}\n{err}\nEnsure the file has a valid default export of a JSON-serializable configuration object.",
+                path.display()
+            ),
+            node_config::LoadError::Node(err) => format!("{}\n{err}", path.display()),
+        })
     }
 }
 

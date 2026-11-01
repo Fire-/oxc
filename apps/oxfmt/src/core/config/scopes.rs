@@ -40,6 +40,7 @@ impl ConfigScopes {
         let editorconfig =
             load_editorconfig(resolve_editorconfig_path(cwd).as_deref()).map_err(load_err)?;
         let loader = ConfigLoader::new(
+            cwd,
             editorconfig,
             #[cfg(feature = "napi")]
             js_config_loader.cloned(),
@@ -69,6 +70,7 @@ impl ConfigScopes {
         let editorconfig =
             load_editorconfig(resolve_editorconfig_path(cwd).as_deref()).ok().flatten();
         let loader = ConfigLoader::new(
+            cwd,
             editorconfig,
             #[cfg(feature = "napi")]
             js_config_loader.cloned(),
@@ -76,7 +78,9 @@ impl ConfigScopes {
         Self::new(root, loader, use_nested)
     }
 
+    /// `use_nested` is the caller's choice, Vite+ mode never uses nested configs.
     fn new(root: ConfigResolver, loader: ConfigLoader, use_nested: bool) -> Self {
+        let use_nested = use_nested && loader.discovery.nested_configs();
         let root = Arc::new(root);
         let has_editorconfig = loader.editorconfig.is_some();
         let nested_ctx = NestedConfigCtx::new(&root, loader);

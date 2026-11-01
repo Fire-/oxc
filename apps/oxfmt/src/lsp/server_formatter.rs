@@ -17,7 +17,7 @@ use oxc_language_server::{
 };
 
 #[cfg(not(feature = "napi"))]
-use oxc_config::is_js_config_path;
+use oxc_config::{ConfigDiscovery, is_js_config_path};
 
 use crate::core::{
     ConfigScopes, FormatResult, Language, ResolveOutcome, SourceFormatter,
@@ -151,7 +151,7 @@ struct FormatterState {
     scopes: ConfigScopes,
     /// `.prettierignore` matchers (workspace-level, shared across all scopes).
     ignore_matchers: Vec<Gitignore>,
-    /// The root config is a JS/TS config, which only the Node.js build can load.
+    /// The root config is a JS/TS config that failed to load.
     /// Formatting with the default options instead would rewrite files in the wrong style.
     #[cfg(not(feature = "napi"))]
     formatting_disabled: bool,
@@ -195,14 +195,19 @@ impl Tool for ServerFormatter {
         let mut patterns: Vec<Pattern> = if let Some(config_path) = options.config_path.as_deref() {
             vec![normalize_user_config_path_to_watch_pattern(config_path)]
         } else {
+            let discovery = config_discovery(&self.root_path);
             // Watch subdirectories too for nested config support;
-            // with `disableNestedConfig`, only the workspace-root config is used
-            let prefix = if options.use_nested_configs() { "**/" } else { "" };
-            config_discovery()
+            // with `disableNestedConfig` or in Vite+ mode, only the workspace-root config is used
+            let prefix =
+                if options.use_nested_configs() && discovery.nested_configs() { "**/" } else { "" };
+            let patterns = discovery
                 .config_file_names()
                 .into_iter()
                 .map(|name| format!("{prefix}{name}"))
-                .collect()
+                .collect();
+            #[cfg(not(feature = "napi"))]
+            let patterns = with_vite_config_names(patterns);
+            patterns
         };
 
         patterns.push(".editorconfig".to_string());
@@ -243,7 +248,7 @@ impl Tool for ServerFormatter {
     fn run_format(&self, document: TextDocument) -> Result<Vec<TextEdit>, String> {
         #[cfg(not(feature = "napi"))]
         if self.snapshot().formatting_disabled {
-            debug!("Formatting is disabled by a JS/TS root config");
+            debug!("Formatting is disabled by a JS/TS root config that failed to load");
             return Ok(vec![]);
         }
 
@@ -343,7 +348,7 @@ impl ServerFormatter {
     /// LSP must keep editing usable even when the user's config is broken,
     /// so the root falls back to the default empty config with a warning instead of bubbling the error up.
     /// Likewise, a broken `.prettierignore` is skipped with a warning.
-    /// Without `napi`, a JS/TS root config disables formatting instead (see [`FormatterState`]).
+    /// Without `napi`, a JS/TS root config that fails to load disables formatting instead (see [`FormatterState`]).
     fn build_state(
         root_path: &Path,
         explicit_config_path: Option<&Path>,
@@ -432,7 +437,9 @@ impl ServerFormatter {
             Ok(r) => r,
             // The root config's style would be wrong for this scope
             #[cfg(not(feature = "napi"))]
-            Err(err) if nearest_config_is_js(path) => return Err(err),
+            Err(err) if nearest_config_is_js(path, &config_discovery(&self.root_path)) => {
+                return Err(err);
+            }
             Err(err) => {
                 warn!(
                     "Failed to resolve nested config for {}: {err}, falling back to root",
@@ -494,19 +501,29 @@ impl ServerFormatter {
 
 // ---
 
+/// Adds the workspace-root `vite.config.*` names, which can turn Vite+ mode on (see [`config_discovery`]).
+#[cfg(not(feature = "napi"))]
+fn with_vite_config_names(mut patterns: Vec<Pattern>) -> Vec<Pattern> {
+    for name in ConfigDiscovery::vite_plus().config_file_names() {
+        if !patterns.iter().any(|pattern| pattern == name) {
+            patterns.push(name.to_string());
+        }
+    }
+    patterns
+}
+
 /// Whether the workspace root config is a JS/TS config, given or discovered like [`ConfigScopes::load`].
 #[cfg(not(feature = "napi"))]
 fn root_config_is_js(root_path: &Path, explicit_config_path: Option<&Path>) -> bool {
     match explicit_config_path {
         Some(path) => is_js_config_path(path),
-        None => nearest_config_is_js(root_path),
+        None => nearest_config_is_js(root_path, &config_discovery(root_path)),
     }
 }
 
 /// Whether the nearest config file upwards from `path` is a JS/TS config.
 #[cfg(not(feature = "napi"))]
-fn nearest_config_is_js(path: &Path) -> bool {
-    let discovery = config_discovery();
+fn nearest_config_is_js(path: &Path, discovery: &ConfigDiscovery) -> bool {
     let nearest =
         path.ancestors().find_map(|dir| discovery.find_unique_config_by_readdir(dir).transpose());
     matches!(nearest, Some(Ok(config)) if is_js_config_path(config.path()))
@@ -821,23 +838,75 @@ mod tests_format {
         assert_eq!(format_uri(&formatter, &untitled, "vue", "<div   ></div>"), Ok(vec![]));
     }
 
-    /// A JS/TS config needs the Node.js build.
-    /// Formatting with the default options instead would rewrite files in the wrong style.
+    #[cfg(not(feature = "napi"))]
+    const THROWING_CONFIG: &str = "throw new Error(\"config exploded\");\nexport default {};\n";
+
+    /// A stub `vite-plus` whose `resolveConfig` returns the config file's default export,
+    /// which is all Vite+ mode needs from it.
+    #[cfg(not(feature = "napi"))]
+    fn install_stub_vite_plus(root: &Path) {
+        let dir = root.join("node_modules").join("vite-plus");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("package.json"),
+            r#"{ "name": "vite-plus", "type": "module", "exports": "./index.js" }"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("index.js"),
+            "import { pathToFileURL } from \"node:url\";\n\
+             export async function resolveConfig({ configFile }) {\n\
+             \x20 return (await import(pathToFileURL(configFile).href)).default;\n\
+             }\n",
+        )
+        .unwrap();
+    }
+
+    /// The single edit `semi: false` makes to `const a = "x";`
+    #[cfg(not(feature = "napi"))]
+    fn assert_only_semicolon_removed(edits: &[TextEdit]) {
+        assert_eq!(edits.len(), 1, "{edits:?}");
+        assert_eq!(edits[0].new_text, "");
+        assert_eq!((edits[0].range.start.line, edits[0].range.start.character), (0, 13));
+        assert_eq!((edits[0].range.end.line, edits[0].range.end.character), (0, 14));
+    }
+
     #[test]
     #[cfg(not(feature = "napi"))]
-    fn js_config_disables_formatting() {
+    fn js_config_is_loaded_with_node() {
+        let config = "const config: { semi: boolean } = { semi: false };\nexport default config;\n";
         for (config_file, options) in [
             ("oxfmt.config.ts", Value::Null),
             ("fmt.config.ts", json!({ "fmt.configPath": "./fmt.config.ts" })),
         ] {
             let dir = tempfile::tempdir().unwrap();
-            fs::write(dir.path().join(config_file), "export default { semi: false };\n").unwrap();
+            fs::write(dir.path().join(config_file), config).unwrap();
+            let (formatter, client_messages) = build(dir.path(), options);
+            assert!(client_messages.is_empty(), "{:?}", messages(&client_messages));
+
+            let file = dir.path().join("a.ts");
+            let edits = format(&formatter, &file, "typescript", "const a = \"x\";\n").unwrap();
+            assert_only_semicolon_removed(&edits);
+        }
+    }
+
+    /// Formatting with the default options instead would rewrite files in the wrong style.
+    #[test]
+    #[cfg(not(feature = "napi"))]
+    fn js_config_that_fails_to_load_disables_formatting() {
+        for (config_file, options) in [
+            ("oxfmt.config.ts", Value::Null),
+            ("fmt.config.ts", json!({ "fmt.configPath": "./fmt.config.ts" })),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            fs::write(dir.path().join(config_file), THROWING_CONFIG).unwrap();
             let (formatter, client_messages) = build(dir.path(), options);
 
             assert_eq!(client_messages.len(), 1, "{:?}", messages(&client_messages));
             let message = &client_messages[0];
             assert_eq!(message.r#type, MessageType::Error);
             assert!(message.message.contains(config_file), "{}", message.message);
+            assert!(message.message.contains("config exploded"), "{}", message.message);
             assert!(message.message.contains("Formatting is disabled"), "{}", message.message);
 
             // The default options would change both
@@ -853,7 +922,7 @@ mod tests_format {
     fn json_config_reenables_formatting_after_js_config_is_replaced() {
         let dir = tempfile::tempdir().unwrap();
         let js_config = dir.path().join("oxfmt.config.ts");
-        fs::write(&js_config, "export default {};\n").unwrap();
+        fs::write(&js_config, THROWING_CONFIG).unwrap();
         let (formatter, _) = build(dir.path(), Value::Null);
         let file = dir.path().join("a.ts");
         assert_eq!(format(&formatter, &file, "typescript", "const a=1"), Ok(vec![]));
@@ -873,7 +942,7 @@ mod tests_format {
 
     #[test]
     #[cfg(not(feature = "napi"))]
-    fn nested_js_config_is_an_error_for_its_scope_only() {
+    fn nested_js_config_applies_to_its_scope() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join(".oxfmtrc.json"), "{}").unwrap();
         let sub = dir.path().join("sub");
@@ -882,12 +951,129 @@ mod tests_format {
         let (formatter, client_messages) = build(dir.path(), Value::Null);
         assert!(client_messages.is_empty(), "{:?}", messages(&client_messages));
 
+        let edits = format(&formatter, &sub.join("a.ts"), "typescript", "const a = \"x\";\n");
+        assert_only_semicolon_removed(&edits.unwrap());
+        let root_file = dir.path().join("b.ts");
+        assert_eq!(format(&formatter, &root_file, "typescript", "const a = \"x\";\n"), Ok(vec![]));
+    }
+
+    #[test]
+    #[cfg(not(feature = "napi"))]
+    fn nested_js_config_that_fails_is_an_error_for_its_scope_only() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(".oxfmtrc.json"), "{}").unwrap();
+        let sub = dir.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("oxfmt.config.ts"), THROWING_CONFIG).unwrap();
+        let (formatter, client_messages) = build(dir.path(), Value::Null);
+        assert!(client_messages.is_empty(), "{:?}", messages(&client_messages));
+
         // No fallback to the root config, which would format in the wrong style
         let err = format(&formatter, &sub.join("a.ts"), "typescript", "const a=1").unwrap_err();
         assert!(err.contains("oxfmt.config.ts"), "{err}");
+        assert!(err.contains("config exploded"), "{err}");
 
         let edits =
             format(&formatter, &dir.path().join("b.ts"), "typescript", "const a=1").unwrap();
         assert_eq!(edits.len(), 1);
+    }
+
+    /// Matches `vp fmt`: only the `fmt` field of the root `vite.config.*` counts,
+    /// `.oxfmtrc.json` and nested `vite.config.*` files are ignored.
+    #[test]
+    #[cfg(not(feature = "napi"))]
+    fn vite_config_fmt_field_is_used_when_vite_plus_is_installed() {
+        let dir = tempfile::tempdir().unwrap();
+        install_stub_vite_plus(dir.path());
+        fs::write(dir.path().join("vite.config.mjs"), "export default { fmt: { semi: false } };\n")
+            .unwrap();
+        fs::write(dir.path().join(".oxfmtrc.json"), r#"{ "singleQuote": true }"#).unwrap();
+        let sub = dir.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("vite.config.mjs"), "export default { fmt: { singleQuote: true } };\n")
+            .unwrap();
+        let (formatter, client_messages) = build(dir.path(), Value::Null);
+        assert!(client_messages.is_empty(), "{:?}", messages(&client_messages));
+
+        for file in [dir.path().join("a.ts"), sub.join("b.ts")] {
+            let edits = format(&formatter, &file, "typescript", "const a = \"x\";\n").unwrap();
+            assert_only_semicolon_removed(&edits);
+        }
+
+        let patterns = formatter.get_watcher_patterns(Value::Null);
+        assert!(patterns.contains(&"vite.config.ts".to_string()), "{patterns:?}");
+        assert!(!patterns.iter().any(|p| p.contains("oxfmtrc")), "{patterns:?}");
+    }
+
+    /// Matches `vp fmt`: a `vite.config.*` without `fmt` means the defaults, not `.oxfmtrc.json`.
+    #[test]
+    #[cfg(not(feature = "napi"))]
+    fn vite_config_without_fmt_field_uses_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        install_stub_vite_plus(dir.path());
+        fs::write(dir.path().join("vite.config.mjs"), "export default {};\n").unwrap();
+        fs::write(dir.path().join(".oxfmtrc.json"), r#"{ "singleQuote": true }"#).unwrap();
+        let (formatter, client_messages) = build(dir.path(), Value::Null);
+        assert!(client_messages.is_empty(), "{:?}", messages(&client_messages));
+
+        let file = dir.path().join("a.ts");
+        assert_eq!(format(&formatter, &file, "typescript", "const a = \"x\";\n"), Ok(vec![]));
+    }
+
+    #[test]
+    #[cfg(not(feature = "napi"))]
+    fn vite_config_is_ignored_without_vite_plus() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("vite.config.mjs"), "export default { fmt: { semi: false } };\n")
+            .unwrap();
+        let (formatter, client_messages) = build(dir.path(), Value::Null);
+        assert!(client_messages.is_empty(), "{:?}", messages(&client_messages));
+
+        let file = dir.path().join("a.ts");
+        assert_eq!(format(&formatter, &file, "typescript", "const a = \"x\";\n"), Ok(vec![]));
+
+        // Still watched, so that adding `vite-plus` and touching the config switches modes
+        let patterns = formatter.get_watcher_patterns(Value::Null);
+        assert!(patterns.contains(&"vite.config.ts".to_string()), "{patterns:?}");
+        assert!(patterns.contains(&"**/.oxfmtrc.json".to_string()), "{patterns:?}");
+    }
+
+    #[test]
+    #[cfg(not(feature = "napi"))]
+    fn invalid_vite_fmt_field_disables_formatting() {
+        let dir = tempfile::tempdir().unwrap();
+        install_stub_vite_plus(dir.path());
+        fs::write(dir.path().join("vite.config.mjs"), "export default { fmt: 1 };\n").unwrap();
+        let (formatter, client_messages) = build(dir.path(), Value::Null);
+
+        assert_eq!(client_messages.len(), 1, "{:?}", messages(&client_messages));
+        let message = &client_messages[0].message;
+        assert!(message.contains("The `fmt` field"), "{message}");
+        assert!(message.contains("Formatting is disabled"), "{message}");
+        let file = dir.path().join("a.ts");
+        assert_eq!(format(&formatter, &file, "typescript", "const a=1"), Ok(vec![]));
+    }
+
+    #[test]
+    #[cfg(not(feature = "napi"))]
+    fn vite_config_change_is_reloaded() {
+        let dir = tempfile::tempdir().unwrap();
+        install_stub_vite_plus(dir.path());
+        let config = dir.path().join("vite.config.mjs");
+        fs::write(&config, "export default { fmt: { semi: false } };\n").unwrap();
+        let (formatter, _) = build(dir.path(), Value::Null);
+        let file = dir.path().join("a.ts");
+        let edits = format(&formatter, &file, "typescript", "const a = \"x\";\n").unwrap();
+        assert_only_semicolon_removed(&edits);
+
+        fs::write(&config, "export default { fmt: {} };\n").unwrap();
+        let changes = formatter.handle_watched_file_change(
+            &ServerFormatterBuilder::dummy(),
+            &file_path_to_uri(&config).unwrap(),
+            &file_path_to_uri(dir.path()).unwrap(),
+            Value::Null,
+        );
+        assert!(changes.client_messages.is_empty(), "{:?}", messages(&changes.client_messages));
+        assert_eq!(format(&formatter, &file, "typescript", "const a = \"x\";\n"), Ok(vec![]));
     }
 }

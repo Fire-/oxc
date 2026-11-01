@@ -13,7 +13,9 @@ The `oxfmt` implemented under this directory serves several purposes.
   - Build with `pnpm build`
 - Pure Rust CLI
   - Limited feature set, CLI usage and LSP (`--lsp`), no Stdin support
-  - LSP disables formatting for a workspace whose root config is JS/TS, since only the Node.js build can load it
+  - JS/TS configs load in a `node` child process (`src/core/config/node_config.rs`), mirroring the Node.js build
+  - Vite+ mode (only `vite.config.*`'s `fmt`, like `vp fmt`) is on with `VP_VERSION`, or when `vite-plus` is installed and a `vite.config.*` is found on the way up to it
+  - LSP disables formatting for a workspace whose root JS/TS config fails to load
   - Formats only languages which we rewrite formatter in Rust
   - Entry point: `main()` in `src/main.rs`
   - Build with `cargo build --no-default-features`
